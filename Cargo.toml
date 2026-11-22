@@ -1,0 +1,31 @@
+[package]
+name = "xshell-gateway"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.95"
+description = "A multi-user chat assistant built on the xshell session daemon"
+
+[[bin]]
+name = "sybild"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "1.1"
+xshell-core = { git = "https://github.com/rdevaul/xshell", branch = "main" }
+xshell-execution = { git = "https://github.com/rdevaul/xshell", branch = "main" }
+xshell-session = { git = "https://github.com/rdevaul/xshell", branch = "main" }
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3.21"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

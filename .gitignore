@@ -1,0 +1,4 @@
+/target
+/.cargo/config.toml
+# Not committed until the xshell dependency is on its main branch (see README).
+/Cargo.lock

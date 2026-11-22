@@ -1,0 +1,38 @@
+# sybild configuration. Copy, edit, and run: sybild run --config PATH
+
+# The assistant's workspace. It holds:
+#   SOUL.md, IDENTITY.md, AGENTS.md      who the assistant is and how it works
+#   memory/shared/MEMORY.md              what every user's conversations may see
+#   memory/personal/NAME/MEMORY.md       one user's memory, seen only in their own
+workspace = "/srv/sybil/workspace"
+
+# State of the embedded xshell session daemon (sessions, socket, turn records).
+state_directory = "/srv/sybil/state"
+
+# Optional xshell configuration for the embedded daemon: model profiles,
+# limits, auditing. Required when [model] names api_key_env: the daemon only
+# sends a credential to an endpoint one of its own [models.NAME] profiles
+# names with the same provider, base_url and api_key_env.
+# xshell_config = "/srv/sybil/xshell.toml"
+
+[model]
+profile_name = "local"
+provider = "ollama"
+model = "qwen3:8b"
+base_url = "http://127.0.0.1:11434"
+# api_key_env = "OPENROUTER_API_KEY"
+# context_tokens = 32768
+
+[telegram]
+# The NAME of the environment variable holding the bot token.
+token_env = "TELEGRAM_BOT_TOKEN"
+
+# The people the assistant talks to. A message from any other account is
+# refused. Find your numeric Telegram id by messaging @userinfobot.
+[[users]]
+name = "alice"
+telegram_id = 111111111
+
+[[users]]
+name = "bob"
+telegram_id = 222222222
