@@ -48,14 +48,16 @@ impl ContextProvider for WorkspaceContext {
             return Ok(None);
         };
         let workspace = self.workspace.clone();
-        tokio::task::spawn_blocking(move || assemble(&workspace, &user).map(Some))
-            .await
-            .context("building the context stopped unexpectedly")?
+        tokio::task::spawn_blocking(move || {
+            assemble(&workspace, &user, crate::schedule::local_now()).map(Some)
+        })
+        .await
+        .context("building the context stopped unexpectedly")?
     }
 }
 
-/// The context for one of `user`'s turns.
-pub fn assemble(workspace: &Workspace, user: &str) -> Result<String> {
+/// The context for one of `user`'s turns, which starts at `now` local time.
+pub fn assemble(workspace: &Workspace, user: &str, now: chrono::NaiveDateTime) -> Result<String> {
     let mut sections = Vec::new();
     for name in OPERATOR_FILES {
         if let Some(text) = workspace.operator_file(name)? {
@@ -68,7 +70,10 @@ pub fn assemble(workspace: &Workspace, user: &str) -> Result<String> {
     sections.push(format!(
         "# This conversation\n\nYou are talking with {user}. Use the memory tools to save what \
 {user} would want remembered and to look up what you saved before. Another person's \
-conversations cannot see {user}'s memory, and you cannot see theirs."
+conversations cannot see {user}'s memory, and you cannot see theirs.\n\nIt is now {}, local \
+time. Use the schedule tools when {user} asks to be reminded of something or wants something \
+done later or regularly.",
+        now.format("%A %Y-%m-%d %H:%M")
     ));
     let shared = workspace.read_memory(Scope::Shared, "MEMORY.md")?;
     let personal = workspace.read_memory(Scope::Personal(user), "MEMORY.md")?;
@@ -116,6 +121,13 @@ mod tests {
     use tempfile::TempDir;
     use xshell_execution::CancellationFlag;
 
+    fn now() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 23)
+            .unwrap()
+            .and_hms_opt(9, 5, 0)
+            .unwrap()
+    }
+
     fn workspace() -> (TempDir, Workspace) {
         let temporary = TempDir::new().unwrap();
         std::fs::write(temporary.path().join("SOUL.md"), "You are Sybil.\n").unwrap();
@@ -146,7 +158,8 @@ mod tests {
     #[test]
     fn a_users_context_has_the_identity_shared_memory_and_only_their_own() {
         let (_temporary, workspace) = workspace();
-        let context = assemble(&workspace, "alice").unwrap();
+        let context = assemble(&workspace, "alice", now()).unwrap();
+        assert!(context.contains("It is now Monday 2026-11-23 09:05, local time."));
         // Operator files first and in order, then the conversation, then memory.
         let positions: Vec<_> = [
             "You are Sybil.",
@@ -168,12 +181,12 @@ mod tests {
     fn missing_files_are_left_out_and_long_ones_are_cut() {
         let temporary = TempDir::new().unwrap();
         let workspace = Workspace::new(temporary.path().to_owned());
-        let context = assemble(&workspace, "alice").unwrap();
+        let context = assemble(&workspace, "alice", now()).unwrap();
         assert!(context.starts_with("# This conversation"));
         assert!(!context.contains("# Memory"));
 
         std::fs::write(temporary.path().join("SOUL.md"), "é".repeat(MAX_FILE_BYTES)).unwrap();
-        let context = assemble(&workspace, "alice").unwrap();
+        let context = assemble(&workspace, "alice", now()).unwrap();
         assert!(context.contains("[the rest of this file is not shown]"));
         assert!(context.len() < 2 * MAX_FILE_BYTES);
     }

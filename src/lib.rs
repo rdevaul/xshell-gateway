@@ -13,9 +13,13 @@
 
 pub mod config;
 pub mod context;
+pub mod cron;
 pub mod directory;
 pub mod gateway;
+pub mod heartbeat;
 pub mod memory;
+pub mod schedule;
+pub mod scheduler;
 pub mod telegram;
 pub mod workspace;
 
@@ -25,14 +29,31 @@ use std::sync::Arc;
 use xshell_execution::ToolRegistry;
 use xshell_session::daemon::Daemon;
 
-/// The session daemon with the assistant's memory tools and context
-/// compiled in. `directory` is shared with the gateway, which records each
-/// user's session in it.
-pub fn daemon(config: &config::Config, directory: Arc<directory::Directory>) -> Result<Daemon> {
+/// The tools every chat session is limited to.
+pub fn session_tools() -> Vec<String> {
+    memory::TOOL_NAMES
+        .iter()
+        .chain(&schedule::TOOL_NAMES)
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// The session daemon with the assistant's tools and context compiled in.
+/// `directory` and `store` are shared with the gateway, which records each
+/// user's session in the one and runs due tasks from the other.
+pub fn daemon(
+    config: &config::Config,
+    directory: Arc<directory::Directory>,
+    store: Arc<schedule::ScheduleStore>,
+) -> Result<Daemon> {
     let workspace = workspace::Workspace::new(config.workspace.clone());
     let tools = ToolRegistry::builder()
         .provider(Arc::new(memory::MemoryProvider::new(
             workspace.clone(),
+            Arc::clone(&directory),
+        )))
+        .provider(Arc::new(schedule::ScheduleProvider::new(
+            store,
             Arc::clone(&directory),
         )))
         .build()?;

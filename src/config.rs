@@ -23,8 +23,32 @@ pub struct Config {
     pub model: Model,
     #[serde(default)]
     pub telegram: Option<Telegram>,
+    /// Periodic check-ins; absent means none.
+    #[serde(default)]
+    pub heartbeat: Option<Heartbeat>,
     #[serde(default, rename = "users")]
     pub users: Vec<User>,
+}
+
+/// When heartbeats run (see [`crate::heartbeat`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Heartbeat {
+    /// Minutes between one user's heartbeats; at least 5.
+    pub every_minutes: u32,
+    /// Local hours heartbeats may run in, as `HH:MM-HH:MM`; any time when
+    /// absent.
+    #[serde(default)]
+    pub active_hours: Option<String>,
+}
+
+impl Heartbeat {
+    pub fn active_hours(&self) -> Result<Option<crate::heartbeat::ActiveHours>> {
+        self.active_hours
+            .as_deref()
+            .map(crate::heartbeat::ActiveHours::parse)
+            .transpose()
+    }
 }
 
 /// A model binding. When it names `api_key_env`, the embedded daemon accepts
@@ -105,6 +129,12 @@ impl Config {
                 bail!("{name} must be an absolute path, not {}", path.display());
             }
         }
+        if let Some(heartbeat) = &self.heartbeat {
+            if heartbeat.every_minutes < 5 {
+                bail!("heartbeat.every_minutes must be at least 5");
+            }
+            heartbeat.active_hours()?;
+        }
         let mut names = HashSet::new();
         let mut accounts = HashSet::new();
         for user in &self.users {
@@ -124,6 +154,10 @@ impl Config {
     /// The embedded daemon's socket.
     pub fn socket(&self) -> PathBuf {
         self.state_directory.join("xshelld.sock")
+    }
+
+    pub fn user(&self, name: &str) -> Option<&User> {
+        self.users.iter().find(|user| user.name == name)
     }
 
     pub fn user_for_telegram(&self, account: i64) -> Option<&User> {
@@ -163,6 +197,24 @@ mod tests {
         assert!(config.user_for_telegram(1).is_none());
         assert_eq!(config.socket(), config.state_directory.join("xshelld.sock"));
         assert!(!config.model.binding().vision);
+        let heartbeat = config.heartbeat.as_ref().unwrap();
+        assert_eq!(heartbeat.every_minutes, 30);
+        assert!(heartbeat.active_hours().unwrap().is_some());
+    }
+
+    #[test]
+    fn heartbeat_settings_are_checked() {
+        for (heartbeat, message) in [
+            ("[heartbeat]\nevery_minutes = 1\n", "at least 5"),
+            (
+                "[heartbeat]\nevery_minutes = 30\nactive_hours = \"all day\"\n",
+                "HH:MM-HH:MM",
+            ),
+        ] {
+            let error = with_users(heartbeat).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+        with_users("[heartbeat]\nevery_minutes = 30\n").unwrap();
     }
 
     fn with_users(users: &str) -> Result<()> {

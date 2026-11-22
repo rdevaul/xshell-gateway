@@ -9,6 +9,7 @@ use std::thread;
 use xshell_gateway::config::Config;
 use xshell_gateway::directory::Directory;
 use xshell_gateway::gateway::Gateway;
+use xshell_gateway::schedule::ScheduleStore;
 use xshell_gateway::telegram::Telegram;
 
 #[derive(Debug, Parser)]
@@ -53,7 +54,8 @@ fn main() -> Result<()> {
 fn run(config: Config) -> Result<()> {
     let config = Arc::new(config);
     let directory = Arc::new(Directory::default());
-    let daemon = xshell_gateway::daemon(&config, Arc::clone(&directory))?;
+    let store = Arc::new(ScheduleStore::new(&config.workspace));
+    let daemon = xshell_gateway::daemon(&config, Arc::clone(&directory), Arc::clone(&store))?;
     // Read the token before anything starts, so a missing one stops the
     // process instead of leaving a daemon nobody can talk to.
     let telegram = match &config.telegram {
@@ -64,7 +66,7 @@ fn run(config: Config) -> Result<()> {
         }
     };
     if let Some(telegram) = telegram {
-        let gateway = Gateway::new(Arc::clone(&config), directory, Arc::new(telegram));
+        let gateway = Gateway::new(Arc::clone(&config), directory, store, Arc::new(telegram));
         // The gateway is a thread of the daemon's own process, which is
         // what lets it connect: the daemon refuses its child processes.
         thread::Builder::new()
@@ -105,6 +107,18 @@ fn check(config: &Config) -> Result<()> {
             );
         }
         None => println!("telegram: not configured"),
+    }
+    match &config.heartbeat {
+        Some(heartbeat) => println!(
+            "heartbeat: every {} minutes{}",
+            heartbeat.every_minutes,
+            heartbeat
+                .active_hours
+                .as_deref()
+                .map(|hours| format!(", {hours} local time"))
+                .unwrap_or_default()
+        ),
+        None => println!("heartbeat: off"),
     }
     println!("users: {}", config.users.len());
     for user in &config.users {

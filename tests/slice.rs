@@ -14,9 +14,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+use xshell_core::ChatMessage;
 use xshell_gateway::config::{Config, Model, User};
 use xshell_gateway::directory::Directory;
-use xshell_gateway::gateway::{Gateway, Inbound, Transport};
+use xshell_gateway::gateway::{Gateway, Inbound, Job, Transport};
+use xshell_gateway::schedule::{ScheduleStore, When};
+use xshell_session::{PersistenceMode, SessionClient, SessionCreation, SessionTools, Visibility};
 
 const ALICE: i64 = 1001;
 const BOB: i64 = 1002;
@@ -149,6 +152,19 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         says("Hello Bob."),
         // Alice's second turn.
         says("You like tea."),
+        // Alice asks for a reminder.
+        calls(
+            "schedule_add",
+            serde_json::json!({"at": "2099-01-01 09:00", "prompt": "call mum"}),
+        ),
+        says("Scheduled."),
+        // Alice's heartbeats: nothing to report, then something.
+        says("HEARTBEAT_OK"),
+        says("High tide is at six."),
+        // A task of Alice's comes due.
+        says("Time to call mum."),
+        // Bob again, after a heartbeat that had nothing to check.
+        says("Still here, Bob."),
     ]);
     let config = Arc::new(Config {
         workspace: workspace.clone(),
@@ -165,6 +181,7 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
             reserve_output_tokens: None,
         },
         telegram: None,
+        heartbeat: None,
         users: vec![
             User {
                 name: "alice".into(),
@@ -180,8 +197,10 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
 
     // The same wiring `sybild run` uses, with a fake chat service.
     let directory = Arc::new(Directory::default());
+    let store = Arc::new(ScheduleStore::new(&config.workspace));
     let daemon = {
-        let daemon = xshell_gateway::daemon(&config, Arc::clone(&directory)).unwrap();
+        let daemon =
+            xshell_gateway::daemon(&config, Arc::clone(&directory), Arc::clone(&store)).unwrap();
         let arguments = xshell_gateway::daemon_arguments(&config);
         thread::spawn(move || daemon.run_with_args(arguments))
     };
@@ -191,7 +210,8 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         inbound: tokio::sync::Mutex::new(inbound),
         sent: Mutex::new(sent),
     });
-    let gateway = Gateway::new(Arc::clone(&config), directory, chat);
+    let gateway = Gateway::new(Arc::clone(&config), directory, store, chat);
+    let dispatcher = gateway.dispatcher();
     thread::spawn(move || {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -236,8 +256,36 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         assert!(!prompt.contains("bob likes coffee"), "{prompt}");
         assert_eq!(
             offered_tools(&requests[0]),
-            ["memory_read", "memory_list", "memory_write"]
+            [
+                "memory_read",
+                "memory_list",
+                "memory_write",
+                "schedule_add",
+                "schedule_list",
+                "schedule_remove"
+            ]
         );
+        assert!(prompt.contains("It is now "), "{prompt}");
+    }
+
+    // Bob already has a session from an earlier build that offered fewer
+    // tools. The gateway replaces it, keeping his conversation.
+    {
+        let mut client = SessionClient::connect(&config.socket(), "test").unwrap();
+        client
+            .create(SessionCreation {
+                name: "chat-bob".into(),
+                model: config.model.binding(),
+                cwd: workspace.join("memory/personal/bob"),
+                persistence: PersistenceMode::Durable,
+                visibility: Visibility::HostOnly,
+                history: vec![
+                    ChatMessage::user("an earlier question"),
+                    ChatMessage::assistant_with_tools("an earlier answer", Vec::new()),
+                ],
+                tools: SessionTools::Only(vec!["memory_read".into()]),
+            })
+            .unwrap();
     }
 
     // Bob: his own memory, none of Alice's.
@@ -250,6 +298,9 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         assert!(!prompt.contains("alice likes tea"), "{prompt}");
         // Bob's conversation holds nothing Alice said.
         assert!(!requests[2].to_string().contains("I like tea"));
+        // The replaced session has today's tools and its old conversation.
+        assert_eq!(offered_tools(&requests[2]).len(), 6);
+        assert!(requests[2].to_string().contains("an earlier question"));
     }
 
     // Alice again: what her agent saved a turn ago is now in her context,
@@ -265,6 +316,64 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         assert!(!prompt.contains("bob likes coffee"), "{prompt}");
         assert!(requests[3].to_string().contains("I like tea"));
     }
+
+    // Alice asks for a reminder; her agent's schedule_add lands in her tasks.
+    assert_eq!(
+        ask(ALICE, "remind me to call mum on new year's day 2099"),
+        (ALICE, "Scheduled.".to_owned())
+    );
+    let schedule = ScheduleStore::new(&config.workspace);
+    let tasks = schedule.list("alice").unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].when, When::At("2099-01-01 09:00".into()));
+    assert_eq!(tasks[0].prompt, "call mum");
+    assert!(schedule.list("bob").unwrap().is_empty());
+
+    // Heartbeats. Alice has a checklist. The first heartbeat's answer is
+    // HEARTBEAT_OK, so nothing is sent; the next message to arrive is the
+    // second heartbeat's.
+    write(
+        &workspace.join("memory/personal/alice/HEARTBEAT.md"),
+        "- tell me about the tides\n",
+    );
+    dispatcher.enqueue("alice", Job::Heartbeat);
+    dispatcher.enqueue("alice", Job::Heartbeat);
+    assert_eq!(
+        replies.recv_timeout(REPLY_TIMEOUT).unwrap(),
+        (ALICE, "High tide is at six.".to_owned())
+    );
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        let heartbeat = requests[6].to_string();
+        assert!(
+            heartbeat.contains("not a message from alice"),
+            "{heartbeat}"
+        );
+        assert!(heartbeat.contains("tell me about the tides"), "{heartbeat}");
+    }
+
+    // A task that has come due runs in Alice's session and reaches her.
+    dispatcher.enqueue("alice", Job::Scheduled(tasks[0].clone()));
+    assert_eq!(
+        replies.recv_timeout(REPLY_TIMEOUT).unwrap(),
+        (ALICE, "Time to call mum.".to_owned())
+    );
+    {
+        let requests = requests.lock().unwrap();
+        let task = requests[8].to_string();
+        assert!(task.contains("Scheduled task 1"), "{task}");
+        assert!(task.contains("call mum"), "{task}");
+    }
+
+    // Bob has no checklist, so his heartbeat asks the model nothing: the
+    // next request is his own message.
+    dispatcher.enqueue("bob", Job::Heartbeat);
+    assert_eq!(
+        ask(BOB, "still there?"),
+        (BOB, "Still here, Bob.".to_owned())
+    );
+    assert_eq!(requests.lock().unwrap().len(), 10);
 
     // Stop the daemon the way a service manager would.
     // SAFETY: kill(2) has no memory-safety preconditions; the daemon in this
