@@ -2,3 +2,10 @@
 /.cargo/config.toml
 # Not committed until the xshell dependency is on its main branch (see README).
 /Cargo.lock
+
+#ignore any secrets in .env
+.env
+
+#ignore any live configs
+config.toml
+
