@@ -23,12 +23,39 @@ pub struct Config {
     pub model: Model,
     #[serde(default)]
     pub telegram: Option<Telegram>,
+    /// Web search for the `web` tool group; absent means no web tools.
+    #[serde(default)]
+    pub web_search: Option<WebSearch>,
     /// Periodic check-ins; absent means none.
     #[serde(default)]
     pub heartbeat: Option<Heartbeat>,
     #[serde(default, rename = "users")]
     pub users: Vec<User>,
 }
+
+/// Which search service `web_search` uses (see [`crate::web`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearch {
+    /// `searxng` or `brave`.
+    pub backend: String,
+    /// The SearXNG instance's address.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The name of the environment variable holding the Brave API key.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+/// The tool groups a user can be given, and the tools in each.
+pub const TOOL_GROUPS: [(&str, &[&str]); 4] = [
+    ("memory", &crate::memory::TOOL_NAMES),
+    ("schedule", &crate::schedule::TOOL_NAMES),
+    ("web", &crate::web::TOOL_NAMES),
+    // xshell's own shell tool. A shell is not confined to one user's data:
+    // see the README before giving this to anyone.
+    ("shell", &["run_shell"]),
+];
 
 /// When heartbeats run (see [`crate::heartbeat`]).
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +135,11 @@ pub struct User {
     /// refused.
     #[serde(default)]
     pub telegram_id: Option<i64>,
+    /// The tool groups this user's agent has: any of `memory`, `schedule`,
+    /// `web` and `shell`. Without it the user gets `memory` and `schedule`,
+    /// plus `web` when `[web_search]` is configured.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
 }
 
 impl Config {
@@ -135,6 +167,41 @@ impl Config {
             }
             heartbeat.active_hours()?;
         }
+        if let Some(search) = &self.web_search {
+            match search.backend.as_str() {
+                "searxng" if search.url.is_none() => {
+                    bail!("web_search.url is required for the searxng backend")
+                }
+                "brave" if search.api_key_env.is_none() => {
+                    bail!("web_search.api_key_env is required for the brave backend")
+                }
+                "searxng" | "brave" => {}
+                other => {
+                    bail!("unknown web_search.backend {other:?}; use \"searxng\" or \"brave\"")
+                }
+            }
+        }
+        for user in &self.users {
+            let mut seen = HashSet::new();
+            for group in user.tools.iter().flatten() {
+                if !TOOL_GROUPS.iter().any(|(name, _)| name == group) {
+                    bail!(
+                        "user {:?} has unknown tool group {group:?}; the groups are memory, \
+schedule, web and shell",
+                        user.name
+                    );
+                }
+                if !seen.insert(group.as_str()) {
+                    bail!("user {:?} lists tool group {group:?} twice", user.name);
+                }
+                if group == "web" && self.web_search.is_none() {
+                    bail!(
+                        "user {:?} has the web tool group, but there is no [web_search] section",
+                        user.name
+                    );
+                }
+            }
+        }
         let mut names = HashSet::new();
         let mut accounts = HashSet::new();
         for user in &self.users {
@@ -154,6 +221,33 @@ impl Config {
     /// The embedded daemon's socket.
     pub fn socket(&self) -> PathBuf {
         self.state_directory.join("xshelld.sock")
+    }
+
+    /// The tool groups `user`'s agent has, in a fixed order.
+    pub fn tool_groups(&self, user: &str) -> Vec<&'static str> {
+        let chosen = self.user(user).and_then(|user| user.tools.as_ref());
+        TOOL_GROUPS
+            .iter()
+            .map(|(group, _)| *group)
+            .filter(|group| match chosen {
+                Some(chosen) => chosen.iter().any(|name| name == group),
+                None => match *group {
+                    "memory" | "schedule" => true,
+                    "web" => self.web_search.is_some(),
+                    _ => false,
+                },
+            })
+            .collect()
+    }
+
+    /// The names of the tools `user`'s session is limited to.
+    pub fn session_tools(&self, user: &str) -> Vec<String> {
+        let groups = self.tool_groups(user);
+        TOOL_GROUPS
+            .iter()
+            .filter(|(group, _)| groups.contains(group))
+            .flat_map(|(_, tools)| tools.iter().map(|tool| (*tool).to_owned()))
+            .collect()
     }
 
     pub fn user(&self, name: &str) -> Option<&User> {
@@ -200,6 +294,81 @@ mod tests {
         let heartbeat = config.heartbeat.as_ref().unwrap();
         assert_eq!(heartbeat.every_minutes, 30);
         assert!(heartbeat.active_hours().unwrap().is_some());
+    }
+
+    #[test]
+    fn users_get_default_tool_groups_unless_they_list_their_own() {
+        let config: Config = toml::from_str(EXAMPLE).unwrap();
+        // The example configures web search, gives alice a shell, and leaves
+        // bob on the defaults.
+        assert_eq!(
+            config.tool_groups("alice"),
+            ["memory", "schedule", "web", "shell"]
+        );
+        assert_eq!(config.tool_groups("bob"), ["memory", "schedule", "web"]);
+        assert_eq!(
+            config.session_tools("bob"),
+            [
+                "memory_read",
+                "memory_list",
+                "memory_write",
+                "schedule_add",
+                "schedule_list",
+                "schedule_remove",
+                "web_search"
+            ]
+        );
+        assert_eq!(config.session_tools("alice").last().unwrap(), "run_shell");
+
+        // Without [web_search], the default leaves web out.
+        with_users("[[users]]\nname = \"a\"\n").unwrap();
+        let plain: Config = toml::from_str(
+            "workspace = \"/w\"\nstate_directory = \"/s\"\n[model]\nprovider = \"p\"\n\
+model = \"m\"\nbase_url = \"u\"\n[[users]]\nname = \"a\"\n[[users]]\nname = \"b\"\n\
+tools = [\"memory\"]\n",
+        )
+        .unwrap();
+        assert_eq!(plain.tool_groups("a"), ["memory", "schedule"]);
+        // A listed selection replaces the default; it does not add to it.
+        assert_eq!(
+            plain.session_tools("b"),
+            ["memory_read", "memory_list", "memory_write"]
+        );
+    }
+
+    #[test]
+    fn tool_groups_and_search_settings_are_checked() {
+        for (extra, message) in [
+            (
+                "[[users]]\nname = \"a\"\ntools = [\"exec\"]\n",
+                "unknown tool group",
+            ),
+            (
+                "[[users]]\nname = \"a\"\ntools = [\"memory\", \"memory\"]\n",
+                "twice",
+            ),
+            (
+                "[[users]]\nname = \"a\"\ntools = [\"web\"]\n",
+                "no [web_search] section",
+            ),
+            ("[web_search]\nbackend = \"searxng\"\n", "url is required"),
+            (
+                "[web_search]\nbackend = \"brave\"\n",
+                "api_key_env is required",
+            ),
+            (
+                "[web_search]\nbackend = \"bing\"\n",
+                "unknown web_search.backend",
+            ),
+        ] {
+            let error = with_users(extra).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+        with_users(
+            "[web_search]\nbackend = \"searxng\"\nurl = \"https://s.example\"\n\
+[[users]]\nname = \"a\"\ntools = [\"web\", \"shell\"]\n",
+        )
+        .unwrap();
     }
 
     #[test]

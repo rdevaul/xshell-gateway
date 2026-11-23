@@ -396,7 +396,7 @@ message from them; your answer will be sent to them.]\n\n{}",
         let mut client = connect(&self.config.socket())?;
         let name = session_name(&self.user);
         let model = self.config.model.binding();
-        let tools = SessionTools::Only(crate::session_tools());
+        let tools = SessionTools::Only(self.config.session_tools(&self.user));
         let creation = |history: Vec<ChatMessage>| -> Result<SessionCreation> {
             Ok(SessionCreation {
                 name: name.clone(),

@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use xshell_core::ChatMessage;
-use xshell_gateway::config::{Config, Model, User};
+use xshell_gateway::config::{Config, Model, User, WebSearch};
 use xshell_gateway::directory::Directory;
 use xshell_gateway::gateway::{Gateway, Inbound, Job, Transport};
 use xshell_gateway::schedule::{ScheduleStore, When};
@@ -93,6 +93,33 @@ Connection: close\r\n\r\n{body}",
     (format!("http://{address}"), requests)
 }
 
+/// A SearXNG instance that answers every search with `body`.
+fn fake_search(body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for socket in listener.incoming() {
+            let mut socket = socket.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    format!("http://{address}")
+}
+
 fn says(content: &str) -> String {
     let chunk = serde_json::json!({"choices": [{"delta": {"content": content}}]});
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
@@ -165,11 +192,33 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         says("Time to call mum."),
         // Bob again, after a heartbeat that had nothing to check.
         says("Still here, Bob."),
+        // Alice searches the web.
+        calls("web_search", serde_json::json!({"query": "tide times"})),
+        says("High tide is at 06:10."),
+        // Alice's agent tries a shell command nothing allows.
+        calls("run_shell", serde_json::json!({"command": "touch marker"})),
+        says("I couldn't run that."),
+        // And one the operator's policy allows.
+        calls(
+            "run_shell",
+            serde_json::json!({"command": "touch allowed-marker"}),
+        ),
+        says("Done."),
     ]);
+    // The operator's xshell configuration allows exactly one command.
+    let xshell_config = root.join("xshell.toml");
+    write(
+        &xshell_config,
+        "[session_fabric.approval_policy]\nalways_allowed = [\"run_shell: touch allowed-marker\"]\n",
+    );
+    let search_url = fake_search(
+        r#"{"results": [{"title": "Tide tables", "url": "https://tides.example/",
+            "content": "High at 06:10."}]}"#,
+    );
     let config = Arc::new(Config {
         workspace: workspace.clone(),
         state_directory: root.join("state"),
-        xshell_config: None,
+        xshell_config: Some(xshell_config),
         model: Model {
             profile_name: Some("fake".into()),
             provider: "openai".into(),
@@ -181,15 +230,28 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
             reserve_output_tokens: None,
         },
         telegram: None,
+        web_search: Some(WebSearch {
+            backend: "searxng".into(),
+            url: Some(search_url),
+            api_key_env: None,
+        }),
         heartbeat: None,
         users: vec![
             User {
                 name: "alice".into(),
                 telegram_id: Some(ALICE),
+                // Everything, including a shell.
+                tools: Some(
+                    ["memory", "schedule", "web", "shell"]
+                        .map(String::from)
+                        .to_vec(),
+                ),
             },
             User {
                 name: "bob".into(),
                 telegram_id: Some(BOB),
+                // No web and no shell.
+                tools: Some(["memory", "schedule"].map(String::from).to_vec()),
             },
         ],
     });
@@ -256,15 +318,19 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         assert!(!prompt.contains("bob likes coffee"), "{prompt}");
         assert_eq!(
             offered_tools(&requests[0]),
+            // The daemon lists its own tools first.
             [
+                "run_shell",
                 "memory_read",
                 "memory_list",
                 "memory_write",
                 "schedule_add",
                 "schedule_list",
-                "schedule_remove"
+                "schedule_remove",
+                "web_search"
             ]
         );
+        assert!(prompt.contains("Use web_search"), "{prompt}");
         assert!(prompt.contains("It is now "), "{prompt}");
     }
 
@@ -299,7 +365,11 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         // Bob's conversation holds nothing Alice said.
         assert!(!requests[2].to_string().contains("I like tea"));
         // The replaced session has today's tools and its old conversation.
+        // Bob's are the memory and schedule tools only.
         assert_eq!(offered_tools(&requests[2]).len(), 6);
+        assert!(!offered_tools(&requests[2]).contains(&"web_search"));
+        assert!(!offered_tools(&requests[2]).contains(&"run_shell"));
+        assert!(!system_prompt(&requests[2]).contains("web_search"));
         assert!(requests[2].to_string().contains("an earlier question"));
     }
 
@@ -374,6 +444,44 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         (BOB, "Still here, Bob.".to_owned())
     );
     assert_eq!(requests.lock().unwrap().len(), 10);
+
+    // Alice's agent searches the web: the result reaches the model as the
+    // tool's output, labelled as text from the web.
+    assert_eq!(
+        ask(ALICE, "when is high tide?"),
+        (ALICE, "High tide is at 06:10.".to_owned())
+    );
+    {
+        let requests = requests.lock().unwrap();
+        let after_search = requests[11].to_string();
+        assert!(after_search.contains("Tide tables"), "{after_search}");
+        assert!(after_search.contains("not instructions"), "{after_search}");
+    }
+
+    // Alice has the shell group, but no approval policy allows this command
+    // and nobody is at a terminal to approve it, so it does not run.
+    assert_eq!(
+        ask(ALICE, "make a marker file"),
+        (ALICE, "I couldn't run that.".to_owned())
+    );
+    assert!(!workspace.join("memory/personal/alice/marker").exists());
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 14);
+        assert!(requests[13].to_string().contains("tool denied"));
+    }
+
+    // A command the operator's policy allows does run, in Alice's directory,
+    // while the memory and schedule tools kept working under that policy.
+    assert_eq!(
+        ask(ALICE, "make the allowed marker"),
+        (ALICE, "Done.".to_owned())
+    );
+    assert!(
+        workspace
+            .join("memory/personal/alice/allowed-marker")
+            .exists()
+    );
 
     // Stop the daemon the way a service manager would.
     // SAFETY: kill(2) has no memory-safety preconditions; the daemon in this

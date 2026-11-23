@@ -20,9 +20,10 @@ Telegram ──▶ gateway ──▶ session daemon (xshell) ──▶ model
                 └─ maps each chat account to a user
 ```
 
-- Each user gets one durable session on the embedded daemon. The session is
-  limited to the memory and schedule tools: it has no shell, cannot read
-  files, and cannot reach the network.
+- Each user gets one durable session on the embedded daemon, limited to
+  the tool groups that user is given. By default that is memory and
+  scheduling, plus web search when it is configured: no shell and no file
+  access.
 - Before every turn the daemon asks the context provider for the system
   prompt: the assistant's identity (`SOUL.md`, `IDENTITY.md`, `AGENTS.md`),
   the shared memory, and that user's memory. It is rebuilt each turn and
@@ -45,6 +46,9 @@ Telegram ──▶ gateway ──▶ session daemon (xshell) ──▶ model
   list"). It keeps the task with `schedule_add`, `schedule_list` and
   `schedule_remove`; when a task is due, the assistant runs it in your
   conversation and sends you the answer.
+- **Web search**, through a SearXNG instance or the Brave Search API.
+- **Per-user tools.** Each user's agent has only the tool groups the
+  configuration gives that user.
 - **Heartbeats.** Every so often the assistant goes through a checklist and
   messages you only if something needs your attention.
 - An end-to-end test of all of the above against a fake model
@@ -52,8 +56,10 @@ Telegram ──▶ gateway ──▶ session daemon (xshell) ──▶ model
 
 ## What is missing
 
-- Web search, browsing, calendar or any other outside tool. The assistant
-  can only use its memory and its schedule.
+- Fetching web pages, a browser, calendar or other outside services. Web
+  search returns titles and snippets, not pages.
+- Approving a command from chat. A shell command either matches an allow
+  rule or does not run.
 - Discord, group chats, images and voice.
 - Skills, and signature checks on them.
 - Memory search; only whole files are read.
@@ -129,6 +135,94 @@ has no model profile that sends that credential to ...".
 **Where to start it.** Start `sybild` from an ordinary terminal or a service
 manager, not from inside an xshell session: the xshell daemon refuses
 connections from its own child processes.
+
+## Tools and who gets them
+
+A user's `tools` line lists the tool groups their agent has. Without it, a
+user gets `memory` and `schedule`, plus `web` when `[web_search]` is
+configured.
+
+| Group | Tools | What it reaches |
+|---|---|---|
+| `memory` | `memory_read`, `memory_list`, `memory_write` | The user's own memory; shared memory read-only |
+| `schedule` | `schedule_add`, `schedule_list`, `schedule_remove` | The user's own tasks |
+| `web` | `web_search` | A search service: titles, addresses and snippets |
+| `shell` | `run_shell` | **This machine**, as the account `sybild` runs under |
+
+```toml
+[[users]]
+name = "rich"
+telegram_id = 111111111
+tools = ["memory", "schedule", "web", "shell"]
+
+[[users]]
+name = "guest"
+telegram_id = 222222222
+tools = ["memory"]
+```
+
+A change takes effect on the user's next message: their session is replaced
+with one that has the new tools, keeping the conversation.
+
+### Web search
+
+```toml
+[web_search]
+backend = "searxng"
+url = "https://searx.example"
+```
+
+or
+
+```toml
+[web_search]
+backend = "brave"
+api_key_env = "BRAVE_API_KEY"    # the variable's name; export the key itself
+```
+
+A SearXNG instance must allow the JSON format (`search.formats` in its
+`settings.yml` must include `json`), or it answers 403. Another search
+service is added by implementing `SearchBackend` in `src/web.rs`.
+
+Search results are text written by strangers. The tool labels them as such
+and the assistant is told not to follow instructions in them, but that is
+advice to a model, not a guarantee. This matters most for a user who also
+has `shell`.
+
+### Shell
+
+**Give `shell` only to someone you trust as you trust yourself.** Everything
+runs under one operating-system account, so a shell command can read every
+user's memory, this configuration, and anything else that account can. The
+separation between users described in
+[docs/architecture.md](docs/architecture.md) does not hold for a user with a
+shell.
+
+Having the group is not enough to run anything. A command runs only if the
+approval policy in the xshell configuration (`xshell_config`) allows it:
+
+```toml
+# xshell.toml
+[session_fabric.approval_policy]
+always_allowed = [
+  "run_shell: gcloud *",
+  "run_shell: git status",
+]
+```
+
+Any other command would need someone to approve it, and nobody is at a
+terminal, so it is refused and the assistant is told so. Notes:
+
+- The policy applies to every user with `shell`; there is no per-user allow
+  list yet.
+- An allow rule covers everything that program can do. `gcloud *` allows all
+  of `gcloud`, and a rule for a program that can run other programs (`find`,
+  `make`, an interpreter) allows those too.
+- Use `always_allowed` only. Adding an `allowed` list makes the policy
+  closed, which also refuses the memory and schedule tools unless you list
+  them.
+- Commands run in the user's memory directory, with a filtered environment:
+  API keys and the bot token in `sybild`'s environment are not passed on.
 
 ## Scheduled tasks and heartbeats
 

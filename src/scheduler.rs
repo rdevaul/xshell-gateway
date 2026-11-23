@@ -136,11 +136,13 @@ mod tests {
                 reserve_output_tokens: None,
             },
             telegram: None,
+            web_search: None,
             heartbeat,
             users: ["alice", "bob"]
                 .map(|name| User {
                     name: name.into(),
                     telegram_id: None,
+                    tools: None,
                 })
                 .to_vec(),
         }

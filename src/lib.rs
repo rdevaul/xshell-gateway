@@ -21,6 +21,7 @@ pub mod memory;
 pub mod schedule;
 pub mod scheduler;
 pub mod telegram;
+pub mod web;
 pub mod workspace;
 
 use anyhow::Result;
@@ -29,25 +30,19 @@ use std::sync::Arc;
 use xshell_execution::ToolRegistry;
 use xshell_session::daemon::Daemon;
 
-/// The tools every chat session is limited to.
-pub fn session_tools() -> Vec<String> {
-    memory::TOOL_NAMES
-        .iter()
-        .chain(&schedule::TOOL_NAMES)
-        .map(|name| (*name).to_owned())
-        .collect()
-}
-
 /// The session daemon with the assistant's tools and context compiled in.
 /// `directory` and `store` are shared with the gateway, which records each
 /// user's session in the one and runs due tasks from the other.
+///
+/// Every tool group is compiled in; which of them a user's agent can use is
+/// decided by that user's session (see [`config::Config::session_tools`]).
 pub fn daemon(
-    config: &config::Config,
+    config: &Arc<config::Config>,
     directory: Arc<directory::Directory>,
     store: Arc<schedule::ScheduleStore>,
 ) -> Result<Daemon> {
     let workspace = workspace::Workspace::new(config.workspace.clone());
-    let tools = ToolRegistry::builder()
+    let mut tools = ToolRegistry::builder()
         .provider(Arc::new(memory::MemoryProvider::new(
             workspace.clone(),
             Arc::clone(&directory),
@@ -55,12 +50,16 @@ pub fn daemon(
         .provider(Arc::new(schedule::ScheduleProvider::new(
             store,
             Arc::clone(&directory),
-        )))
-        .build()?;
+        )));
+    if let Some(search) = &config.web_search {
+        tools = tools.provider(Arc::new(web::WebProvider::new(web::backend(search)?)));
+    }
     Ok(Daemon::new()
-        .with_tools(tools)
+        .with_tools(tools.build()?)
         .with_context(Arc::new(context::WorkspaceContext::new(
-            workspace, directory,
+            workspace,
+            directory,
+            Arc::clone(config),
         ))))
 }
 

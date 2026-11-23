@@ -120,12 +120,21 @@ fn check(config: &Config) -> Result<()> {
         ),
         None => println!("heartbeat: off"),
     }
+    match &config.web_search {
+        Some(search) => println!("web search: {}", search.backend),
+        None => println!("web search: off"),
+    }
     println!("users: {}", config.users.len());
     for user in &config.users {
-        match user.telegram_id {
-            Some(id) => println!("  {} (Telegram {id})", user.name),
-            None => println!("  {} (no chat account)", user.name),
-        }
+        let account = match user.telegram_id {
+            Some(id) => format!("Telegram {id}"),
+            None => "no chat account".to_owned(),
+        };
+        println!(
+            "  {} ({account}): {}",
+            user.name,
+            config.tool_groups(&user.name).join(", ")
+        );
     }
     Ok(())
 }

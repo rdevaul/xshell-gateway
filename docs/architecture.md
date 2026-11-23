@@ -94,9 +94,16 @@ What enforces it:
 - **Memory paths are checked in one place** (`Workspace::resolve`): a few
   plain name segments ending in `.md`, under the user's directory, with no
   symbolic link anywhere on the path.
-- **Chat sessions have no other tools.** The session's tool selection is the
-  memory and schedule tools, enforced by the daemon. There is no shell and
-  no file tool, so there is no way around them.
+- **Chat sessions have no other tools.** A session's tool selection is the
+  user's tool groups from the configuration, enforced by the daemon. By
+  default there is no shell and no file tool, so there is no way around the
+  memory tools.
+- **A user given the `shell` group is outside this table.** A shell command
+  runs as the one account everything runs under and can read all of it. The
+  daemon still refuses any command its approval policy does not allow, and
+  it refuses connections from the commands it runs, so a shell cannot grant
+  itself more or answer its own approvals. But what an allowed program can
+  read is not limited.
 - **Sessions the gateway did not create have no user.** A session someone
   opens with the `xshell` client gets no assistant context and the memory
   tools refuse it.
@@ -133,6 +140,6 @@ Topic files are read on demand with `memory_read`.
 
 ## Next
 
-In rough order: web search and page fetching as tools, skills with signature
-checks, Discord, images, memory search, per-user time zones, and summarizing
+In rough order: approving a command from chat, fetching web pages, skills
+with signature checks, Discord, images, memory search, per-user time zones, and summarizing
 compaction in xshell.
