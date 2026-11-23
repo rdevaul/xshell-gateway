@@ -1,1 +1,8 @@
 /target
+
+# Secrets, such as the bot token and API keys.
+.env
+
+# A live configuration at the top of the repository. The example to copy is
+# config.example.toml.
+/config.toml
