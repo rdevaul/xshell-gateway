@@ -52,6 +52,7 @@ fn main() -> Result<()> {
 }
 
 fn run(config: Config) -> Result<()> {
+    config.check_shell_ceiling()?;
     let config = Arc::new(config);
     let directory = Arc::new(Directory::default());
     let store = Arc::new(ScheduleStore::new(&config.workspace));
@@ -131,10 +132,17 @@ fn check(config: &Config) -> Result<()> {
             None => "no chat account".to_owned(),
         };
         println!(
-            "  {} ({account}): {}",
+            "  {} ({account}): {}{}",
             user.name,
-            config.tool_groups(&user.name).join(", ")
+            config.tool_groups(&user.name).join(", "),
+            match user.shell {
+                Some(_) => ", UNRESTRICTED SHELL",
+                None => "",
+            }
         );
+    }
+    if let Err(problem) = config.check_shell_ceiling() {
+        println!("PROBLEM: {problem:#}");
     }
     Ok(())
 }

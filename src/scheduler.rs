@@ -143,6 +143,7 @@ mod tests {
                     name: name.into(),
                     telegram_id: None,
                     tools: None,
+                    shell: None,
                 })
                 .to_vec(),
         }

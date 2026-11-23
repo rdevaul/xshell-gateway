@@ -7,7 +7,7 @@
 //! session, and the client is blocking. Different users' turns run at the
 //! same time, up to the daemon's own limit.
 
-use crate::config::Config;
+use crate::config::{Config, Shell};
 use crate::directory::{Directory, session_name};
 use crate::schedule::{ScheduleStore, Task};
 use crate::workspace::Workspace;
@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use xshell_core::ChatMessage;
 use xshell_execution::{
-    ApprovalDecision, ApprovalPolicy, ApprovalSource, Approver, ExecutionEvent,
+    ApprovalDecision, ApprovalPolicy, ApprovalSource, Approver, ExecutionEvent, TurnLimits,
 };
 use xshell_session::{
     PersistenceMode, SessionClient, SessionCreation, SessionEventKind, SessionTools, TurnInput,
@@ -324,16 +324,24 @@ message from them; your answer will be sent to them.]\n\n{}",
             self.session = Some(self.open_session()?);
         }
         let session = self.session.as_mut().expect("the session was just opened");
-        let turn_id = session.client.submit(
+        let (approval, limits) = match self.config.shell(&self.user) {
+            // An unrestricted shell runs commands without asking, and gets
+            // the long limits that builds and test suites need.
+            Some(Shell::Unrestricted) => (ApprovalPolicy::Auto, Some(TurnLimits::relaxed())),
+            // Other sessions hold only tools that need no approval. `ask`
+            // is still the right mode: anything that would prompt is denied
+            // below, since nobody is at a terminal to answer.
+            None => (ApprovalPolicy::Ask, None),
+        };
+        let turn_id = session.client.submit_with_limits(
             session.id.clone(),
             TurnInput::Agent {
                 message: text.to_owned(),
                 images: Vec::new(),
             },
-            // Chat sessions hold only tools that need no approval. `ask`
-            // is still the right mode: anything that would prompt is denied
-            // below, since nobody is at a terminal to answer.
-            ApprovalPolicy::Ask,
+            approval,
+            limits,
+            None,
         )?;
         let mut answer = None;
         loop {

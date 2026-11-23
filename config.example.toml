@@ -54,16 +54,18 @@ active_hours = "08:00-22:00"
 #   memory    read and write the user's own memory; read shared memory
 #   schedule  reminders and scheduled tasks
 #   web       web_search (needs [web_search] above)
-#   shell     run commands on this machine. NOT confined to the user's own
-#             data: give it only to someone you trust as you trust yourself.
-#             A command runs only if the approval policy in the xshell
-#             configuration allows it; see the README.
 # Without `tools`, a user gets memory and schedule, plus web when
 # [web_search] is configured.
+#
+# `shell = "unrestricted"` lets a user's agent run any command on this
+# machine without asking, as the account sybild runs under. It is NOT
+# confined to that user's data: give it only to someone you trust as you
+# trust yourself. It needs max_approval = "auto" in the xshell configuration;
+# see "Shell" in the README, which also covers logging every command.
 [[users]]
 name = "alice"
 telegram_id = 111111111
-tools = ["memory", "schedule", "web", "shell"]
+shell = "unrestricted"
 
 [[users]]
 name = "bob"

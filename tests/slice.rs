@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use xshell_core::ChatMessage;
-use xshell_gateway::config::{Config, Model, User, WebSearch};
+use xshell_gateway::config::{Config, Model, Shell, User, WebSearch};
 use xshell_gateway::directory::Directory;
 use xshell_gateway::gateway::{Gateway, Inbound, Job, Transport};
 use xshell_gateway::schedule::{ScheduleStore, When};
@@ -195,21 +195,19 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         // Alice searches the web.
         calls("web_search", serde_json::json!({"query": "tide times"})),
         says("High tide is at 06:10."),
-        // Alice's agent tries a shell command nothing allows.
+        // Alice's agent runs a shell command, then one the operator denies.
         calls("run_shell", serde_json::json!({"command": "touch marker"})),
-        says("I couldn't run that."),
-        // And one the operator's policy allows.
-        calls(
-            "run_shell",
-            serde_json::json!({"command": "touch allowed-marker"}),
-        ),
         says("Done."),
+        calls("run_shell", serde_json::json!({"command": "rm marker"})),
+        says("I couldn't remove it."),
     ]);
-    // The operator's xshell configuration allows exactly one command.
+    // An unrestricted shell needs the daemon's ceiling raised. The xshell
+    // approval policy still applies to it: here the operator denies `rm`.
     let xshell_config = root.join("xshell.toml");
     write(
         &xshell_config,
-        "[session_fabric.approval_policy]\nalways_allowed = [\"run_shell: touch allowed-marker\"]\n",
+        "[session_fabric]\nmax_approval = \"auto\"\n\
+[session_fabric.approval_policy]\ndenied = [\"run_shell: rm *\"]\n",
     );
     let search_url = fake_search(
         r#"{"results": [{"title": "Tide tables", "url": "https://tides.example/",
@@ -241,21 +239,20 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
                 name: "alice".into(),
                 telegram_id: Some(ALICE),
                 // Everything, including a shell.
-                tools: Some(
-                    ["memory", "schedule", "web", "shell"]
-                        .map(String::from)
-                        .to_vec(),
-                ),
+                tools: None,
+                shell: Some(Shell::Unrestricted),
             },
             User {
                 name: "bob".into(),
                 telegram_id: Some(BOB),
                 // No web and no shell.
                 tools: Some(["memory", "schedule"].map(String::from).to_vec()),
+                shell: None,
             },
         ],
     });
     config.validate().unwrap();
+    config.check_shell_ceiling().unwrap();
 
     // The same wiring `sybild run` uses, with a fake chat service.
     let directory = Arc::new(Directory::default());
@@ -458,30 +455,30 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         assert!(after_search.contains("not instructions"), "{after_search}");
     }
 
-    // Alice has the shell group, but no approval policy allows this command
-    // and nobody is at a terminal to approve it, so it does not run.
+    // Alice has an unrestricted shell: her agent's command runs without
+    // anyone approving it, in her directory.
+    let marker = workspace.join("memory/personal/alice/marker");
     assert_eq!(
         ask(ALICE, "make a marker file"),
-        (ALICE, "I couldn't run that.".to_owned())
-    );
-    assert!(!workspace.join("memory/personal/alice/marker").exists());
-    {
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 14);
-        assert!(requests[13].to_string().contains("tool denied"));
-    }
-
-    // A command the operator's policy allows does run, in Alice's directory,
-    // while the memory and schedule tools kept working under that policy.
-    assert_eq!(
-        ask(ALICE, "make the allowed marker"),
         (ALICE, "Done.".to_owned())
     );
-    assert!(
-        workspace
-            .join("memory/personal/alice/allowed-marker")
-            .exists()
+    assert!(marker.exists());
+    // The operator's xshell policy still binds it: `rm` is denied.
+    assert_eq!(
+        ask(ALICE, "remove the marker"),
+        (ALICE, "I couldn't remove it.".to_owned())
     );
+    assert!(marker.exists());
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 16);
+        assert!(
+            requests[15]
+                .to_string()
+                .contains("denied by the approval policy")
+        );
+        assert!(system_prompt(&requests[12]).contains("run_shell"));
+    }
 
     // Stop the daemon the way a service manager would.
     // SAFETY: kill(2) has no memory-safety preconditions; the daemon in this

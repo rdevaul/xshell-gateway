@@ -48,7 +48,7 @@ Telegram ──▶ gateway ──▶ session daemon (xshell) ──▶ model
   conversation and sends you the answer.
 - **Web search**, through a SearXNG instance or the Brave Search API.
 - **Per-user tools.** Each user's agent has only the tool groups the
-  configuration gives that user.
+  configuration gives that user, and a shell only if they are given one.
 - **Heartbeats.** Every so often the assistant goes through a checklist and
   messages you only if something needs your attention.
 - An end-to-end test of all of the above against a fake model
@@ -58,8 +58,8 @@ Telegram ──▶ gateway ──▶ session daemon (xshell) ──▶ model
 
 - Fetching web pages, a browser, calendar or other outside services. Web
   search returns titles and snippets, not pages.
-- Approving a command from chat. A shell command either matches an allow
-  rule or does not run.
+- A confined shell. Shell access is all or nothing today; confining it to
+  chosen directories is being designed in xshell.
 - Discord, group chats, images and voice.
 - Skills, and signature checks on them.
 - Memory search; only whole files are read.
@@ -140,20 +140,20 @@ connections from its own child processes.
 
 A user's `tools` line lists the tool groups their agent has. Without it, a
 user gets `memory` and `schedule`, plus `web` when `[web_search]` is
-configured.
+configured. Shell access is a separate setting, `shell`.
 
-| Group | Tools | What it reaches |
+| Setting | Tools | What it reaches |
 |---|---|---|
-| `memory` | `memory_read`, `memory_list`, `memory_write` | The user's own memory; shared memory read-only |
-| `schedule` | `schedule_add`, `schedule_list`, `schedule_remove` | The user's own tasks |
-| `web` | `web_search` | A search service: titles, addresses and snippets |
-| `shell` | `run_shell` | **This machine**, as the account `sybild` runs under |
+| `tools`: `memory` | `memory_read`, `memory_list`, `memory_write` | The user's own memory; shared memory read-only |
+| `tools`: `schedule` | `schedule_add`, `schedule_list`, `schedule_remove` | The user's own tasks |
+| `tools`: `web` | `web_search` | A search service: titles, addresses and snippets |
+| `shell = "unrestricted"` | `run_shell` | **This machine**, as the account `sybild` runs under |
 
 ```toml
 [[users]]
 name = "rich"
 telegram_id = 111111111
-tools = ["memory", "schedule", "web", "shell"]
+shell = "unrestricted"
 
 [[users]]
 name = "guest"
@@ -162,7 +162,8 @@ tools = ["memory"]
 ```
 
 A change takes effect on the user's next message: their session is replaced
-with one that has the new tools, keeping the conversation.
+with one that has the new tools, keeping the conversation. `sybild check`
+shows what each user has.
 
 ### Web search
 
@@ -191,38 +192,66 @@ has `shell`.
 
 ### Shell
 
-**Give `shell` only to someone you trust as you trust yourself.** Everything
-runs under one operating-system account, so a shell command can read every
-user's memory, this configuration, and anything else that account can. The
-separation between users described in
-[docs/architecture.md](docs/architecture.md) does not hold for a user with a
-shell.
+`shell = "unrestricted"` lets a user's agent run any command on this machine
+without asking first, with long time limits suited to builds and test runs.
+It is meant for agentic work such as coding in a local clone of a
+repository.
 
-Having the group is not enough to run anything. A command runs only if the
-approval policy in the xshell configuration (`xshell_config`) allows it:
+**Give it only to someone you trust as you trust yourself.** Everything runs
+under one operating-system account, so a command can read and change
+whatever that account can: every user's memory, this configuration, your
+other files, and the network. The separation between users described in
+[docs/architecture.md](docs/architecture.md) does not hold for a user with a
+shell. Text the agent reads from outside (web results, emails, logs, files in
+a repository) can try to steer it; it is told not to act on such text, but
+that is advice to a model, not a guarantee. Give the account's credentials
+only the reach the work needs, such as a token that can open pull requests
+but not push to protected branches.
+
+It needs one line in the xshell configuration (`xshell_config`), because the
+session daemon otherwise asks before every command and nobody can answer
+from chat. `sybild` refuses to start without it and says so:
 
 ```toml
 # xshell.toml
-[session_fabric.approval_policy]
-always_allowed = [
-  "run_shell: gcloud *",
-  "run_shell: git status",
-]
+[session_fabric]
+max_approval = "auto"
 ```
 
-Any other command would need someone to approve it, and nobody is at a
-terminal, so it is refused and the assistant is told so. Notes:
+Commands start in the user's memory directory; the agent uses `cd DIR && ...`
+to work elsewhere. They get a filtered environment: API keys and the bot
+token in `sybild`'s environment are not passed on, though a command can read
+files that hold them.
 
-- The policy applies to every user with `shell`; there is no per-user allow
-  list yet.
-- An allow rule covers everything that program can do. `gcloud *` allows all
-  of `gcloud`, and a rule for a program that can run other programs (`find`,
-  `make`, an interpreter) allows those too.
-- Use `always_allowed` only. Adding an `allowed` list makes the policy
-  closed, which also refuses the memory and schedule tools unless you list
-  them.
-- Commands run in the user's memory directory, with a filtered environment:
-  API keys and the bot token in `sybild`'s environment are not passed on.
+**Rules and logging come from xshell, not from this gateway.** Two parts of
+the xshell configuration apply to an unrestricted shell:
+
+- **Approval policy.** `denied` rules still refuse commands:
+
+  ```toml
+  [session_fabric.approval_policy]
+  denied = ["run_shell: rm *", "run_shell: git push *"]
+  ```
+
+  A deny list is a guard against mistakes, not a wall: xshell's own
+  documentation lists the ways a determined command gets around one.
+- **Audit log.** With auditing on, the daemon records every command the
+  agent asks for, the decision, and the result, in a hash-chained, signed
+  log, whether or not anyone is watching. It needs xshell's audit service,
+  `xshell-auditd`, running:
+
+  ```toml
+  [audit]
+  enabled = true
+  required = true          # refuse to run anything that cannot be recorded
+  socket = "/srv/sybil/audit/audit.sock"
+  directory = "/srv/sybil/audit"
+  ```
+
+  See [xshell's audit documentation](https://github.com/rdevaul/xshell/blob/main/docs/auditing.md)
+  for running the service and verifying a log. If the audit service runs
+  under the same account as `sybild`, a command could tamper with the log
+  files; run it under its own account for a log the agent cannot alter.
 
 ## Scheduled tasks and heartbeats
 

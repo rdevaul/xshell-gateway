@@ -98,12 +98,14 @@ What enforces it:
   user's tool groups from the configuration, enforced by the daemon. By
   default there is no shell and no file tool, so there is no way around the
   memory tools.
-- **A user given the `shell` group is outside this table.** A shell command
-  runs as the one account everything runs under and can read all of it. The
-  daemon still refuses any command its approval policy does not allow, and
-  it refuses connections from the commands it runs, so a shell cannot grant
-  itself more or answer its own approvals. But what an allowed program can
-  read is not limited.
+- **A user with `shell = "unrestricted"` is outside this table.** Their
+  agent's commands run as the one account everything runs under, without
+  approval, and can read and change all of it. What still holds: the daemon
+  applies its approval policy's `denied` rules, records every command when
+  auditing is on, and refuses connections from the commands it runs, so a
+  shell cannot change its own session's tools or raise another user's
+  access through the daemon. Confining a shell to chosen directories needs
+  an operating-system sandbox, which is being designed in xshell.
 - **Sessions the gateway did not create have no user.** A session someone
   opens with the `xshell` client gets no assistant context and the memory
   tools refuse it.
@@ -140,6 +142,6 @@ Topic files are read on demand with `memory_read`.
 
 ## Next
 
-In rough order: approving a command from chat, fetching web pages, skills
-with signature checks, Discord, images, memory search, per-user time zones, and summarizing
+In rough order: a shell confined to chosen directories (in xshell), fetching
+web pages, skills with signature checks, Discord, images, memory search, per-user time zones, and summarizing
 compaction in xshell.
