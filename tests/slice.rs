@@ -14,9 +14,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
-use xshell_gateway::config::{Config, Model, User};
+use xshell_core::ChatMessage;
+use xshell_gateway::config::{Config, Model, Shell, User, WebSearch};
 use xshell_gateway::directory::Directory;
-use xshell_gateway::gateway::{Gateway, Inbound, Transport};
+use xshell_gateway::gateway::{Gateway, Inbound, Job, Transport};
+use xshell_gateway::schedule::{ScheduleStore, When};
+use xshell_session::{PersistenceMode, SessionClient, SessionCreation, SessionTools, Visibility};
 
 const ALICE: i64 = 1001;
 const BOB: i64 = 1002;
@@ -90,6 +93,33 @@ Connection: close\r\n\r\n{body}",
     (format!("http://{address}"), requests)
 }
 
+/// A SearXNG instance that answers every search with `body`.
+fn fake_search(body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for socket in listener.incoming() {
+            let mut socket = socket.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    format!("http://{address}")
+}
+
 fn says(content: &str) -> String {
     let chunk = serde_json::json!({"choices": [{"delta": {"content": content}}]});
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
@@ -149,11 +179,44 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         says("Hello Bob."),
         // Alice's second turn.
         says("You like tea."),
+        // Alice asks for a reminder.
+        calls(
+            "schedule_add",
+            serde_json::json!({"at": "2099-01-01 09:00", "prompt": "call mum"}),
+        ),
+        says("Scheduled."),
+        // Alice's heartbeats: nothing to report, then something.
+        says("HEARTBEAT_OK"),
+        says("High tide is at six."),
+        // A task of Alice's comes due.
+        says("Time to call mum."),
+        // Bob again, after a heartbeat that had nothing to check.
+        says("Still here, Bob."),
+        // Alice searches the web.
+        calls("web_search", serde_json::json!({"query": "tide times"})),
+        says("High tide is at 06:10."),
+        // Alice's agent runs a shell command, then one the operator denies.
+        calls("run_shell", serde_json::json!({"command": "touch marker"})),
+        says("Done."),
+        calls("run_shell", serde_json::json!({"command": "rm marker"})),
+        says("I couldn't remove it."),
     ]);
+    // An unrestricted shell needs the daemon's ceiling raised. The xshell
+    // approval policy still applies to it: here the operator denies `rm`.
+    let xshell_config = root.join("xshell.toml");
+    write(
+        &xshell_config,
+        "[session_fabric]\nmax_approval = \"auto\"\n\
+[session_fabric.approval_policy]\ndenied = [\"run_shell: rm *\"]\n",
+    );
+    let search_url = fake_search(
+        r#"{"results": [{"title": "Tide tables", "url": "https://tides.example/",
+            "content": "High at 06:10."}]}"#,
+    );
     let config = Arc::new(Config {
         workspace: workspace.clone(),
         state_directory: root.join("state"),
-        xshell_config: None,
+        xshell_config: Some(xshell_config),
         model: Model {
             profile_name: Some("fake".into()),
             provider: "openai".into(),
@@ -165,23 +228,38 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
             reserve_output_tokens: None,
         },
         telegram: None,
+        web_search: Some(WebSearch {
+            backend: "searxng".into(),
+            url: Some(search_url),
+            api_key_env: None,
+        }),
+        heartbeat: None,
         users: vec![
             User {
                 name: "alice".into(),
                 telegram_id: Some(ALICE),
+                // Everything, including a shell.
+                tools: None,
+                shell: Some(Shell::Unrestricted),
             },
             User {
                 name: "bob".into(),
                 telegram_id: Some(BOB),
+                // No web and no shell.
+                tools: Some(["memory", "schedule"].map(String::from).to_vec()),
+                shell: None,
             },
         ],
     });
     config.validate().unwrap();
+    config.check_shell_ceiling().unwrap();
 
     // The same wiring `sybild run` uses, with a fake chat service.
     let directory = Arc::new(Directory::default());
+    let store = Arc::new(ScheduleStore::new(&config.workspace));
     let daemon = {
-        let daemon = xshell_gateway::daemon(&config, Arc::clone(&directory)).unwrap();
+        let daemon =
+            xshell_gateway::daemon(&config, Arc::clone(&directory), Arc::clone(&store)).unwrap();
         let arguments = xshell_gateway::daemon_arguments(&config);
         thread::spawn(move || daemon.run_with_args(arguments))
     };
@@ -191,7 +269,8 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         inbound: tokio::sync::Mutex::new(inbound),
         sent: Mutex::new(sent),
     });
-    let gateway = Gateway::new(Arc::clone(&config), directory, chat);
+    let gateway = Gateway::new(Arc::clone(&config), directory, store, chat);
+    let dispatcher = gateway.dispatcher();
     thread::spawn(move || {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -236,8 +315,40 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         assert!(!prompt.contains("bob likes coffee"), "{prompt}");
         assert_eq!(
             offered_tools(&requests[0]),
-            ["memory_read", "memory_list", "memory_write"]
+            // The daemon lists its own tools first.
+            [
+                "run_shell",
+                "memory_read",
+                "memory_list",
+                "memory_write",
+                "schedule_add",
+                "schedule_list",
+                "schedule_remove",
+                "web_search"
+            ]
         );
+        assert!(prompt.contains("Use web_search"), "{prompt}");
+        assert!(prompt.contains("It is now "), "{prompt}");
+    }
+
+    // Bob already has a session from an earlier build that offered fewer
+    // tools. The gateway replaces it, keeping his conversation.
+    {
+        let mut client = SessionClient::connect(&config.socket(), "test").unwrap();
+        client
+            .create(SessionCreation {
+                name: "chat-bob".into(),
+                model: config.model.binding(),
+                cwd: workspace.join("memory/personal/bob"),
+                persistence: PersistenceMode::Durable,
+                visibility: Visibility::HostOnly,
+                history: vec![
+                    ChatMessage::user("an earlier question"),
+                    ChatMessage::assistant_with_tools("an earlier answer", Vec::new()),
+                ],
+                tools: SessionTools::Only(vec!["memory_read".into()]),
+            })
+            .unwrap();
     }
 
     // Bob: his own memory, none of Alice's.
@@ -250,6 +361,13 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         assert!(!prompt.contains("alice likes tea"), "{prompt}");
         // Bob's conversation holds nothing Alice said.
         assert!(!requests[2].to_string().contains("I like tea"));
+        // The replaced session has today's tools and its old conversation.
+        // Bob's are the memory and schedule tools only.
+        assert_eq!(offered_tools(&requests[2]).len(), 6);
+        assert!(!offered_tools(&requests[2]).contains(&"web_search"));
+        assert!(!offered_tools(&requests[2]).contains(&"run_shell"));
+        assert!(!system_prompt(&requests[2]).contains("web_search"));
+        assert!(requests[2].to_string().contains("an earlier question"));
     }
 
     // Alice again: what her agent saved a turn ago is now in her context,
@@ -264,6 +382,102 @@ fn a_chat_message_becomes_a_turn_with_that_users_memory_and_tools() {
         assert!(prompt.contains("alice likes tea"), "{prompt}");
         assert!(!prompt.contains("bob likes coffee"), "{prompt}");
         assert!(requests[3].to_string().contains("I like tea"));
+    }
+
+    // Alice asks for a reminder; her agent's schedule_add lands in her tasks.
+    assert_eq!(
+        ask(ALICE, "remind me to call mum on new year's day 2099"),
+        (ALICE, "Scheduled.".to_owned())
+    );
+    let schedule = ScheduleStore::new(&config.workspace);
+    let tasks = schedule.list("alice").unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].when, When::At("2099-01-01 09:00".into()));
+    assert_eq!(tasks[0].prompt, "call mum");
+    assert!(schedule.list("bob").unwrap().is_empty());
+
+    // Heartbeats. Alice has a checklist. The first heartbeat's answer is
+    // HEARTBEAT_OK, so nothing is sent; the next message to arrive is the
+    // second heartbeat's.
+    write(
+        &workspace.join("memory/personal/alice/HEARTBEAT.md"),
+        "- tell me about the tides\n",
+    );
+    dispatcher.enqueue("alice", Job::Heartbeat);
+    dispatcher.enqueue("alice", Job::Heartbeat);
+    assert_eq!(
+        replies.recv_timeout(REPLY_TIMEOUT).unwrap(),
+        (ALICE, "High tide is at six.".to_owned())
+    );
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        let heartbeat = requests[6].to_string();
+        assert!(
+            heartbeat.contains("not a message from alice"),
+            "{heartbeat}"
+        );
+        assert!(heartbeat.contains("tell me about the tides"), "{heartbeat}");
+    }
+
+    // A task that has come due runs in Alice's session and reaches her.
+    dispatcher.enqueue("alice", Job::Scheduled(tasks[0].clone()));
+    assert_eq!(
+        replies.recv_timeout(REPLY_TIMEOUT).unwrap(),
+        (ALICE, "Time to call mum.".to_owned())
+    );
+    {
+        let requests = requests.lock().unwrap();
+        let task = requests[8].to_string();
+        assert!(task.contains("Scheduled task 1"), "{task}");
+        assert!(task.contains("call mum"), "{task}");
+    }
+
+    // Bob has no checklist, so his heartbeat asks the model nothing: the
+    // next request is his own message.
+    dispatcher.enqueue("bob", Job::Heartbeat);
+    assert_eq!(
+        ask(BOB, "still there?"),
+        (BOB, "Still here, Bob.".to_owned())
+    );
+    assert_eq!(requests.lock().unwrap().len(), 10);
+
+    // Alice's agent searches the web: the result reaches the model as the
+    // tool's output, labelled as text from the web.
+    assert_eq!(
+        ask(ALICE, "when is high tide?"),
+        (ALICE, "High tide is at 06:10.".to_owned())
+    );
+    {
+        let requests = requests.lock().unwrap();
+        let after_search = requests[11].to_string();
+        assert!(after_search.contains("Tide tables"), "{after_search}");
+        assert!(after_search.contains("not instructions"), "{after_search}");
+    }
+
+    // Alice has an unrestricted shell: her agent's command runs without
+    // anyone approving it, in her directory.
+    let marker = workspace.join("memory/personal/alice/marker");
+    assert_eq!(
+        ask(ALICE, "make a marker file"),
+        (ALICE, "Done.".to_owned())
+    );
+    assert!(marker.exists());
+    // The operator's xshell policy still binds it: `rm` is denied.
+    assert_eq!(
+        ask(ALICE, "remove the marker"),
+        (ALICE, "I couldn't remove it.".to_owned())
+    );
+    assert!(marker.exists());
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 16);
+        assert!(
+            requests[15]
+                .to_string()
+                .contains("denied by the approval policy")
+        );
+        assert!(system_prompt(&requests[12]).contains("run_shell"));
     }
 
     // Stop the daemon the way a service manager would.

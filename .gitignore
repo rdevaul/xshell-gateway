@@ -1,11 +1,8 @@
 /target
-/.cargo/config.toml
-# Not committed until the xshell dependency is on its main branch (see README).
-/Cargo.lock
 
-#ignore any secrets in .env
+# Secrets, such as the bot token and API keys.
 .env
 
-#ignore any live configs
-config.toml
-
+# A live configuration at the top of the repository. The example to copy is
+# config.example.toml.
+/config.toml

@@ -7,8 +7,9 @@
 | Part | Where | What it does |
 |---|---|---|
 | Session daemon | `xshell_session::daemon::Daemon`, main thread | Runs agent turns, enforces each session's tools, stores conversations, owns the socket |
-| Providers | `src/memory.rs`, `src/context.rs`, compiled into the daemon | The memory tools and the per-turn system prompt |
+| Providers | `src/memory.rs`, `src/schedule.rs`, `src/context.rs`, compiled into the daemon | The memory and schedule tools and the per-turn system prompt |
 | Gateway | `src/gateway.rs`, its own thread and async runtime | Receives chat messages, gives each user a session, sends answers |
+| Scheduler | `src/scheduler.rs`, a task on the gateway's runtime | Checks the clock and queues heartbeats and due tasks |
 
 They share one value, the `Directory` (`src/directory.rs`): a map from the
 daemon's session ids to users. The gateway writes it when it opens a user's
@@ -29,14 +30,49 @@ and a single process means one thing to start, stop and supervise.
    connection to the daemon and handles one message at a time, so a user's
    turns never overlap. Different users' workers run at the same time.
 4. On its first message the worker attaches the user's session, `chat-NAME`,
-   or creates it: durable, visible only on this host, limited to the three
-   memory tools, with the user's memory directory as its working directory.
+   or creates it: durable, visible only on this host, limited to the memory
+   and schedule tools, with the user's memory directory as its working
+   directory.
    It records the session id in the `Directory`.
 5. The worker submits the message as an agent turn.
 6. The daemon calls `WorkspaceContext` for the turn's system prompt, then
    runs the turn. Memory tool calls go to `MemoryProvider`.
 7. The worker reads the turn's events, keeps the model's final answer, and
    sends it to the chat in pieces of at most 4096 characters.
+
+## Heartbeats and scheduled tasks
+
+A user's worker takes three kinds of job from one queue: a chat message, a
+heartbeat, and a due task. They run one at a time, in order, as turns in the
+same session, so a task can refer to the conversation and never overlaps
+with a reply.
+
+The scheduler wakes every 20 seconds and asks, for each user:
+
+- **Tasks:** which of their tasks have a firing time since the last check?
+  `ScheduleStore::take_due` answers from `schedule/NAME.json`. A one-off task
+  is removed as it is taken, so it runs once, and it is due however late the
+  check is. A repeating task is only looked for in the last five minutes, so
+  a machine that slept all night does not run a night's worth at once.
+- **Heartbeat:** is it time, inside active hours, and is the user idle? The
+  worker then builds the heartbeat message from the checklists. With no
+  checklist it does nothing and the model is not called.
+
+The assistant manages tasks through tools, which makes scheduling a normal
+part of conversation. The tools work out the user from the session, as the
+memory tools do, so one user's agent cannot see or change another's tasks.
+What a task can do when it runs is exactly what the user's agent can do in
+conversation: use memory and the schedule. A task's prompt was written by
+the agent, so the turn that runs it is labelled as a scheduled task and not
+as a message from the user.
+
+Answers go to the user's private chat with the bot, whose id is the same as
+their Telegram account id. A heartbeat's answer is dropped when it is
+`HEARTBEAT_OK`, alone or with a short note.
+
+A session's tool list is fixed when the daemon creates it. When a build adds
+tools, the gateway notices that a user's existing session has a different
+list, closes it, and creates a new one with the same conversation.
 
 ## Who can see what
 
@@ -46,6 +82,7 @@ and a single process means one thing to start, stop and supervise.
 | `memory/shared/` | Read | Read |
 | `memory/personal/alice/` | Read and write | Nothing |
 | `memory/personal/bob/` | Nothing | Read and write |
+| Alice's scheduled tasks | Add, list, remove | Nothing |
 | Alice's conversation | Its own history | Nothing |
 
 What enforces it:
@@ -57,9 +94,18 @@ What enforces it:
 - **Memory paths are checked in one place** (`Workspace::resolve`): a few
   plain name segments ending in `.md`, under the user's directory, with no
   symbolic link anywhere on the path.
-- **Chat sessions have no other tools.** The session's tool selection is the
-  three memory tools, enforced by the daemon. There is no shell and no file
-  tool, so there is no way around the memory tools.
+- **Chat sessions have no other tools.** A session's tool selection is the
+  user's tool groups from the configuration, enforced by the daemon. By
+  default there is no shell and no file tool, so there is no way around the
+  memory tools.
+- **A user with `shell = "unrestricted"` is outside this table.** Their
+  agent's commands run as the one account everything runs under, without
+  approval, and can read and change all of it. What still holds: the daemon
+  applies its approval policy's `denied` rules, records every command when
+  auditing is on, and refuses connections from the commands it runs, so a
+  shell cannot change its own session's tools or raise another user's
+  access through the daemon. Confining a shell to chosen directories needs
+  an operating-system sandbox, which is being designed in xshell.
 - **Sessions the gateway did not create have no user.** A session someone
   opens with the `xshell` client gets no assistant context and the memory
   tools refuse it.
@@ -96,6 +142,6 @@ Topic files are read on demand with `memory_read`.
 
 ## Next
 
-In rough order: heartbeat and scheduled jobs (as turns the gateway submits
-on a timer), skills with signature checks, Discord, images, memory search,
-and summarizing compaction in xshell.
+In rough order: a shell confined to chosen directories (in xshell), fetching
+web pages, skills with signature checks, Discord, images, memory search, per-user time zones, and summarizing
+compaction in xshell.
